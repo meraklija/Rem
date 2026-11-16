@@ -18,6 +18,14 @@ import {
   invalidateSemanticEscapedPath,
   invalidateSemanticMutationPaths,
 } from "./javascriptSemanticMutationValues.js";
+import {
+  type JavaScriptSemanticMemberEffect,
+  resolveSemanticBindingState,
+  semanticBindingLookupAt,
+  type JavaScriptSemanticAnalysisState,
+  type JavaScriptSemanticBindingState,
+  type JavaScriptSemanticReferenceEffectsAtSite,
+} from "./javascriptSemanticState.js";
 import type { JavaScriptSemanticValue } from "./javascriptSemanticValueTypes.js";
 import type { SemanticAliasSelectionPath } from "./javascriptSemanticAliasSelections.js";
 import {
@@ -35,14 +43,6 @@ import {
   semanticReadPrecedesEffectWithinActivation,
   semanticTopLevelEffectFollowsCapture,
 } from "./javascriptSemanticMutationInitializers.js";
-import {
-  resolveSemanticBindingState,
-  semanticBindingLookupAt,
-  type JavaScriptSemanticAnalysisState,
-  type JavaScriptSemanticBindingState,
-  type JavaScriptSemanticMemberEffect,
-  type JavaScriptSemanticReferenceEffectsAtSite,
-} from "./javascriptSemanticState.js";
 
 export const indexSemanticOpaqueEffects = (
   candidates: readonly {
@@ -718,6 +718,13 @@ export const bindingMethodMayHaveChanged = (
   );
 };
 
+/** The recorded member writes to `binding`'s object, in record order. */
+export function* semanticMemberWrites(
+  binding: JavaScriptSemanticBindingState,
+): Generator<MemberWrite> {
+  yield* binding.memberWrites;
+}
+
 /** Whether a member write to `binding`'s object is recorded. */
 export const bindingHasMemberWrites = (
   binding: JavaScriptSemanticBindingState,
@@ -979,20 +986,22 @@ export const applySemanticBindingReferenceEffects = (
   binding: JavaScriptSemanticBindingState,
   state: JavaScriptSemanticAnalysisState,
   capturePoint: t.Node | undefined,
+  retainedWrites: ReadonlySet<JavaScriptSemanticMemberEffect> = new Set(),
 ): JavaScriptSemanticValue => {
   let projected = invalidateSemanticMutationPaths(
     value,
     binding.memberWrites
       .filter(
-        ({ node }) =>
-          capturePoint === undefined ||
-          node === undefined ||
-          !semanticBindingEffectFollowsCapture(
-            binding,
-            capturePoint,
-            node,
-            state.parentsByNode,
-          ),
+        (effect) =>
+          !retainedWrites.has(effect) &&
+          (capturePoint === undefined ||
+            effect.node === undefined ||
+            !semanticBindingEffectFollowsCapture(
+              binding,
+              capturePoint,
+              effect.node,
+              state.parentsByNode,
+            )),
       )
       .map(({ path }) => path),
   );
