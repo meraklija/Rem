@@ -37,7 +37,6 @@ import {
 import {
   probeRequests,
   requestBody,
-  sendsBodies,
   type ProbeStep,
   type UnobservedRecord,
 } from "./environmentCompareProbe.js";
@@ -314,11 +313,40 @@ const stepOf = (
   };
 };
 
-/** Answer one probe request as the environment would and compare it with the application's answer; one without an answer is only made. */
-const compareStep = (
+/** Match a probe request after translating ids learned by earlier steps. */
+const translatedCall = (
   run: ProbeRun,
   manifest: EnvironmentSource["manifest"],
   probe: ProbeStep,
+): {
+  readonly liveSegments: readonly string[];
+  readonly call: ProbeToolCall | undefined;
+} => {
+  const liveSegments = probe.request.path.slice(1).split("/");
+  const fitted = matchProbeRequest(manifest, probe.request, run.bodies);
+  const scopes =
+    fitted === undefined
+      ? undefined
+      : parameterScopes(fitted.tool, liveSegments);
+  const literals =
+    fitted === undefined ? undefined : literalPositions(fitted.tool);
+  const path = translatePath(
+    probe.request.path,
+    run.map,
+    (index) => scopes?.get(index),
+    (index) => literals?.has(index) === true,
+  );
+  return {
+    liveSegments,
+    call: matchProbeRequest(manifest, { ...probe.request, path }, run.bodies),
+  };
+};
+
+/** Answer one probe request as the environment would and compare it with the application's answer; one without an answer is only made. */
+const compareStep = (
+  run: ProbeRun,
+  probe: ProbeStep,
+  translated: ReturnType<typeof translatedCall>,
 ): CompareStep | undefined => {
   const { request, live } = probe;
   const base = {
@@ -334,21 +362,7 @@ const compareStep = (
     live === undefined ? undefined : stepOf(base, call, outcome);
   // Matched in the environment's terms, so a tool whose path holds a seeded id literally still matches. Scopes and
   // literals come from the live path: translating a parent id first would name a different collection than learning did.
-  const liveSegments = request.path.slice(1).split("/");
-  const fitted = matchProbeRequest(manifest, request, run.bodies);
-  const scopes =
-    fitted === undefined
-      ? undefined
-      : parameterScopes(fitted.tool, liveSegments);
-  const literals =
-    fitted === undefined ? undefined : literalPositions(fitted.tool);
-  const path = translatePath(
-    request.path,
-    run.map,
-    (index) => scopes?.get(index),
-    (index) => literals?.has(index) === true,
-  );
-  const call = matchProbeRequest(manifest, { ...request, path }, run.bodies);
+  const { liveSegments, call } = translated;
   if (call === undefined)
     return report(call, {
       env_status: null,
@@ -514,14 +528,15 @@ export const compareEnvironment = (input: {
   for (const [index, probe] of input.probes.entries()) {
     // A probe's request bodies are its call arguments, which a replay projection of a browser capture drops.
     const capture = parseCaptureEvidence(operation, probe.value, "manifest");
+    const requests = capture.ok
+      ? probeRequests(capture.value.records)
+      : undefined;
     // Without response bodies only statuses would compare, and without request bodies writes would be made empty.
     const problem = !capture.ok
       ? capture.error.message
       : !capture.value.responseBodies
         ? "a browser probe needs capture.network.response_body selected, or only statuses would compare."
-        : !capture.value.requestBodies && sendsBodies(capture.value.records)
-          ? "a browser probe that makes POST, PUT or PATCH calls needs capture.network.request_body selected, or those calls would be made without their bodies."
-          : undefined;
+        : undefined;
     if (!capture.ok || problem !== undefined)
       return err(
         inputError(
@@ -548,10 +563,37 @@ export const compareEnvironment = (input: {
       map: new IdMap(),
       normalised: emptyNormalised(),
     };
-    const { steps, unobserved } = probeRequests(capture.value.records);
-    const results = steps.flatMap(
-      (step) => compareStep(run, source.manifest, step) ?? [],
-    );
+    const { steps, unobserved } = requests!;
+    const results: CompareStep[] = [];
+    let needsRequestBodies = false;
+    for (const step of steps) {
+      const translated = translatedCall(run, source.manifest, step);
+      const { call } = translated;
+      if (
+        !capture.value.requestBodies &&
+        (["POST", "PUT", "PATCH"].includes(step.request.method) ||
+          (call !== undefined && bodies.has(call.tool.name)))
+      ) {
+        needsRequestBodies = true;
+        continue;
+      }
+      const result = compareStep(run, step, translated);
+      if (result !== undefined) results.push(result);
+    }
+    if (!capture.value.requestBodies && needsRequestBodies)
+      return err(
+        inputError(
+          operation,
+          [
+            {
+              path: ["probe", index],
+              reason: "invalid_value",
+              message: `${probe.label}: a browser probe that makes POST, PUT or PATCH calls, or calls a served tool with a body argument, needs capture.network.request_body selected, or those calls would be made without their bodies.`,
+            },
+          ],
+          "A probe file cannot be compared.",
+        ),
+      );
     probes.push(
       probeReport(
         { label: probe.label, evidenceId: capture.value.evidenceId },
