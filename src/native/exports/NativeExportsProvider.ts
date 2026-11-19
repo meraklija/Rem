@@ -1,3 +1,5 @@
+import { setImmediate } from "node:timers/promises";
+
 import {
   parseFailureAnalysisError,
   parseLimitConstraint,
@@ -38,7 +40,7 @@ import {
 import {
   NATIVE_EXPORT_LIMITS,
   type NativeExportLimit,
-  parseNativeExports,
+  parseNativeExportsSteps,
 } from "../../domain/native/nativeExportParser.js";
 import { errorMessage } from "../../kernel/errorMessage.js";
 
@@ -73,13 +75,20 @@ export class NativeExportsProvider implements NativeExportsPort {
           this.#resources,
         );
         assertArtifactReadActive(options?.signal);
-        const report = parseNativeExports(snapshot.bytes, {
+        const steps = parseNativeExportsSteps(snapshot.bytes, {
           path: input.path,
           sha256: snapshot.sha256,
           bytes: snapshot.bytes.length,
         });
+        let step = steps.next();
+        while (!step.done) {
+          // Dispatch queued CLI/MCP cancellation between bounded parser batches.
+          await setImmediate();
+          assertArtifactReadActive(options?.signal);
+          step = steps.next();
+        }
         assertArtifactReadActive(options?.signal);
-        return ok(report);
+        return ok(step.value);
       });
     } catch (cause) {
       return err(nativeExportsFailure(cause, input, snapshot));
