@@ -12,6 +12,7 @@ export interface AptSourceStanza {
   readonly file: string;
   /** apt's number for the entry: a one-line entry's line, a deb822 entry's stanza, counted from 1. */
   readonly position: number;
+  readonly format: "one-line" | "deb822";
   readonly uris: readonly AptSourceUri[];
   readonly suites: readonly string[];
   readonly components: readonly string[];
@@ -31,7 +32,7 @@ interface AptSourceUri {
 /** One `deb` entry of an apt sources file for one URI and suite. */
 export interface AptSourceEntry extends Omit<
   AptSourceStanza,
-  "uris" | "suites"
+  "uris" | "suites" | "format"
 > {
   readonly uri: string | null;
   /** Whether the entry's URI held a user name or password, which `uri` leaves out. */
@@ -75,20 +76,125 @@ export const withoutCredentialsIn = (text: string): string =>
 const withTrailingSlash = (uri: string): string =>
   uri.endsWith("/") ? uri : `${uri}/`;
 
-const EMPTY_AUTHORITY = /^([a-z][a-z0-9+.-]*:)\/\/(?=\/)/iu;
-const NUMERIC_PORT =
-  /^([a-z][a-z0-9+.-]*:\/\/(?:\[[^\]]+\]|[^/:]+)):([0-9]+)(?=\/|$)/iu;
+const SCHEME_AUTHORITY = /^([a-z][a-z0-9+.-]*):\/\//iu;
+const LONG_MAX = (1n << 63n) - 1n;
+const LONG_MIN = -(1n << 63n);
+/** Largest magnitude strtol can return: LONG_MAX, or LONG_MIN's absolute value. */
+const PORT_MAGNITUDE_LIMIT = LONG_MAX + 1n;
+
+const isAsciiSpace = (character: string): boolean =>
+  character === " " ||
+  character === "\t" ||
+  character === "\n" ||
+  character === "\v" ||
+  character === "\f" ||
+  character === "\r";
+
+/**
+ * APT assigns `atoi(suffix)` to an unsigned 32-bit port. The magnitude stops
+ * growing once it passes the signed 64-bit limit; further digits are skipped.
+ * Trailing junk ends the conversion, and a zero result is omitted.
+ */
+const aptPort = (suffix: string): number => {
+  let index = 0;
+  while (index < suffix.length && isAsciiSpace(suffix[index] ?? "")) index += 1;
+  const sign = suffix[index];
+  const negative = sign === "-";
+  if (sign === "+" || sign === "-") index += 1;
+  let magnitude = 0n;
+  let overflow = false;
+  while (index < suffix.length) {
+    const code = suffix.charCodeAt(index);
+    if (code < 48 || code > 57) break;
+    index += 1;
+    if (overflow) continue;
+    const digit = BigInt(code - 48);
+    if (magnitude > (PORT_MAGNITUDE_LIMIT - digit) / 10n) {
+      overflow = true;
+      continue;
+    }
+    magnitude = magnitude * 10n + digit;
+  }
+  const value = overflow
+    ? negative
+      ? LONG_MIN
+      : LONG_MAX
+    : negative
+      ? -magnitude
+      : magnitude > LONG_MAX
+        ? LONG_MAX
+        : magnitude;
+  return Number(BigInt.asUintN(32, BigInt.asIntN(32, value)));
+};
+
+/** The first path slash, ignoring a slash inside an IPv6 bracket. */
+const authorityEnd = (value: string): number => {
+  let inBracket = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "[") inBracket = true;
+    else if (character === "]" && inBracket) inBracket = false;
+    else if (character === "/" && !inBracket) return index;
+  }
+  return value.length;
+};
+
+/**
+ * APT's deb822 Repo-URI host and port. Path octets stay as authored. An
+ * unclosed IPv6 bracket or a port that consumes the host drops the authority.
+ */
+const aptAuthorityUri = (uri: string): string => {
+  const scheme = SCHEME_AUTHORITY.exec(uri);
+  if (scheme === null) return uri;
+  const schemeText = scheme[1] ?? "";
+  const rest = uri.slice(scheme[0].length);
+  const end = authorityEnd(rest);
+  const authority = rest.slice(0, end);
+  const path = rest.slice(end);
+  // `file://` has no path, and APT keeps both slashes. A path after the
+  // empty host, as in `file:///srv`, drops that host.
+  if (authority.length === 0)
+    return path.length === 0 ? `${schemeText}://` : `${schemeText}:${path}`;
+
+  const at = authority.lastIndexOf("@");
+  const userinfo = at === -1 ? "" : authority.slice(0, at + 1);
+  let host = at === -1 ? authority : authority.slice(at + 1);
+  let portEnd = 0;
+  let inBracket = false;
+  let index = 0;
+  while (index < host.length) {
+    const character = host[index];
+    if (character === "[") {
+      inBracket = true;
+      host = `${host.slice(0, index)}${host.slice(index + 1)}`;
+      continue;
+    }
+    if (inBracket && character === "]") {
+      inBracket = false;
+      host = `${host.slice(0, index)}${host.slice(index + 1)}`;
+      portEnd = index;
+      continue;
+    }
+    index += 1;
+  }
+  if (inBracket) return `${schemeText}:${path}`;
+
+  const colon = host.lastIndexOf(":");
+  let port = 0;
+  if (colon !== -1 && colon >= portEnd) {
+    port = aptPort(host.slice(colon + 1));
+    host = host.slice(0, colon);
+  }
+  if (host.length === 0) return `${schemeText}:${path}`;
+  const rendered =
+    host.includes(":") || host.includes("/") ? `[${host}]` : host;
+  const renderedPort = port === 0 ? "" : `:${String(port)}`;
+  return `${schemeText}://${userinfo}${rendered}${renderedPort}${path}`;
+};
 
 /** APT fixes up deb822 URIs before emitting Repo-URI, leaving path octets intact. */
 const deb822RepoUri = (uri: string): string =>
-  withTrailingSlash(
-    uri
-      .replace(EMPTY_AUTHORITY, "$1")
-      .replace(NUMERIC_PORT, (_match, authority: string, port: string) => {
-        const digits = port.replace(/^0+/u, "");
-        return digits === "" ? authority : `${authority}:${digits}`;
-      }),
-  );
+  withTrailingSlash(aptAuthorityUri(uri));
 
 /**
  * The key block a deb822 Signed-By field holds, as apt writes it to a key
@@ -106,9 +212,25 @@ const inlineKeyBlock = (value: string): string | null => {
   return `${lines.slice(begin, end < begin ? lines.length : end + 1).join("\n")}\n`;
 };
 
-/** Whether a suite as an entry writes it is a target's release, which apt leaves empty for the flat suite `/`. */
-const isRelease = (suite: string, release: string): boolean =>
-  suite === release || (suite === "/" && release === "");
+/** APT expands this variable in repository URIs and suites using APT::Architecture. */
+const expandAptArchitecture = (
+  value: string,
+  architecture: string | undefined,
+): string | undefined => {
+  const variable = "$(ARCH)";
+  if (!value.includes(variable)) return value;
+  return architecture === undefined
+    ? undefined
+    : value.replaceAll(variable, architecture);
+};
+
+/** Match the selected release without changing an authored suite. */
+const isRelease = (suite: string, target: AptIndexTarget): boolean => {
+  const selected = expandAptArchitecture(suite, target.configuredArchitecture);
+  return (
+    selected === target.release || (selected === "/" && target.release === "")
+  );
+};
 
 const stanza = (
   at: { readonly file: string; readonly position: number },
@@ -124,6 +246,7 @@ const stanza = (
   const inlineKey = inlineKeyBlock(signedBy);
   return {
     ...at,
+    format: fields.oneLine === true ? "one-line" : "deb822",
     uris: fields.uris.map((source) => {
       const uri = withoutCredentials(source);
       return fields.oneLine === true && ONE_LINE_ESCAPED_USER_INFO.test(uri)
@@ -262,8 +385,10 @@ export interface AptIndexTarget {
   /** Without a user name or password, as `baseUri`, whether or not apt printed them. */
   readonly repoUri: string;
   readonly repoUriCredentialsRemoved?: true;
-  /** The suite as the entry writes it; empty for the flat suite `/`. */
+  /** APT's selected suite after variable expansion; empty for the flat suite `/`. */
   readonly release: string;
+  /** Effective APT::Architecture from apt-config, distinct from an index's architecture. */
+  readonly configuredArchitecture?: string;
   /** The entry's component the index belongs to; null for a flat repository. */
   readonly component: string | null;
   /** The URI of the folder holding the release's InRelease, Release and Release.gpg. */
@@ -281,6 +406,7 @@ const SOURCES_ENTRY = /^(?<file>\/.*):(?<position>[1-9]\d*)$/u;
 /** The index targets of `apt-get indextargets` output; a paragraph missing a field REA needs is skipped. */
 export const parseAptIndexTargets = (
   output: string | Buffer,
+  configuredArchitecture?: string,
 ): readonly AptIndexTarget[] =>
   deb822Paragraphs(output).flatMap((fields) => {
     const at = SOURCES_ENTRY.exec(fields.get("sourcesentry") ?? "")?.groups;
@@ -309,6 +435,9 @@ export const parseAptIndexTargets = (
           ? {}
           : { repoUriCredentialsRemoved: true as const }),
         release: fields.get("release") ?? "",
+        ...(configuredArchitecture === undefined
+          ? {}
+          : { configuredArchitecture }),
         component: optional("component"),
         baseUri: withoutCredentials(baseUri),
         filename,
@@ -333,21 +462,28 @@ export const entryForTarget = (
       candidate.position === target.position,
   );
   if (at === undefined) return undefined;
-  const { uris, suites, ...entry } = at;
-  const single = uris.length === 1 && suites.length === 1;
+  const { uris, suites, format, ...entry } = at;
+  const single = format === "one-line";
   // A one-line entry has one URI and one suite. Only deb822 needs a URI lookup.
   const matches = single
     ? uris
-    : uris.filter(
-        ({ uri }) => uri !== null && deb822RepoUri(uri) === target.repoUri,
-      );
+    : uris.filter(({ uri }) => {
+        if (uri === null) return false;
+        const selected = expandAptArchitecture(
+          uri,
+          target.configuredArchitecture,
+        );
+        return (
+          selected !== undefined && deb822RepoUri(selected) === target.repoUri
+        );
+      });
   const first = matches[0];
   if (first === undefined) return undefined;
   const uri =
     first.uri === null ? null : withoutOptionalTrailingSlash(first.uri);
   const suite = single
     ? suites[0]
-    : suites.find((listed) => isRelease(listed, target.release));
+    : suites.find((listed) => isRelease(listed, target));
   if (
     suite === undefined ||
     matches.some(({ uri: listed }) =>
@@ -488,7 +624,7 @@ export const declaredPackageFiles = (
       declarations.some(
         ({ repoUri, suite, components }) =>
           repoUri === target.repoUri &&
-          isRelease(suite, target.release) &&
+          isRelease(suite, target) &&
           (target.component === null
             ? components.length === 0
             : components.includes(target.component)),
