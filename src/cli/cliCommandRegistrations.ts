@@ -150,6 +150,11 @@ export const CLI_COMMAND_REGISTRATIONS = {
     (module, context) =>
       module.registerPythonPycCommands(context.cli, context.logger),
   ),
+  debPackage: plain(
+    () => import("./debPackageCommands.js"),
+    (module, context) =>
+      module.registerDebPackageCommands(context.cli, context.logger),
+  ),
   nugetNupkg: plain(
     () => import("./nugetNupkgCommands.js"),
     (module, context) =>
@@ -452,6 +457,7 @@ const CLI_FAMILY_REGISTRATIONS: {
     "gpu",
     "rust",
     "pythonPyc",
+    "debPackage",
     "nugetNupkg",
     "erlang",
     "v8CodeCache",

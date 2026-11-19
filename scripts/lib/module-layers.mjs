@@ -60,6 +60,7 @@ export const UNIT_LAYERS = Object.freeze(
       "browser",
       "captures",
       "cutter",
+      "deb",
       "desktop",
       "dotnet",
       "electron",
@@ -271,6 +272,7 @@ export const ENTRY_FILES = Object.freeze(
         "CutterBridgeService.ts",
         "CutterProviderIdentity.ts",
       ],
+      deb: ["DebPackageProvider.ts", "DebPackageProviderIdentity.ts"],
       desktop: [
         "AgentEnvComputer.ts",
         "AgentEnvProviderIdentity.ts",
