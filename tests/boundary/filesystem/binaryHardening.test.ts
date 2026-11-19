@@ -1,8 +1,16 @@
+import { createHash } from "node:crypto";
 import { readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { scheduler } from "node:timers/promises";
+import { describe, expect, it, vi } from "vitest";
+import { runWithAnalysisOperationSnapshot } from "../../../src/domain/analysisOperationSnapshot.js";
+import {
+  MAXIMUM_ZSTD_MAX_FRAMES,
+  MINIMUM_ZSTD_MAX_FRAMES,
+} from "../../../src/domain/analysisResourceLimits.js";
 import { createBinaryHardeningService } from "../../../src/composition/binaryDiagnostics.js";
 import { elfHardeningFixture } from "../../../src/native/hardening/BinaryHardening.fixture.js";
+import { elfFrameAllowanceFixture } from "../../fixtures/binaryDiagnostics/elfFrameAllowance.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 describe("binary hardening stable filesystem boundary", () => {
@@ -94,6 +102,89 @@ describe("binary hardening stable filesystem boundary", () => {
         fixedAllowance: { limit: 65_536, unit: "entries" },
       });
     } finally {
+      await service.close();
+    }
+  });
+});
+
+describe("binary hardening compressed ELF names", () => {
+  it("projects a section-name frame cap as an adjustable zstd.max_frames limit", async () => {
+    const root = await createTestTempDirectory("rea-binary-hardening-zstd-");
+    const path = join(root, "app");
+    await writeFile(path, elfFrameAllowanceFixture());
+    const service = createBinaryHardeningService();
+    try {
+      const result = await runWithAnalysisOperationSnapshot(
+        { revision: 1, overrides: { "zstd.max_frames": 1 } },
+        () =>
+          service.inspect({ path }, { signal: new AbortController().signal }),
+      );
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error).toMatchObject({
+        _tag: "AnalysisResourceConstraintError",
+        operation: "inspect_binary_hardening",
+        resource: "cpu",
+        limit: {
+          setting: "zstd.max_frames",
+          effective_value: 1,
+          source: "runtime",
+          minimum: MINIMUM_ZSTD_MAX_FRAMES,
+          maximum: MAXIMUM_ZSTD_MAX_FRAMES,
+          unit: "count",
+        },
+      });
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("observes cancellation while decoding ELF names after the file snapshot closes", async () => {
+    const root = await createTestTempDirectory("rea-binary-hardening-cancel-");
+    const path = join(root, "app");
+    const bytes = elfFrameAllowanceFixture();
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    await writeFile(path, bytes);
+    const service = createBinaryHardeningService();
+    const controller = new AbortController();
+    const reason = new Error("stop section-name decoding");
+    const yieldToEventLoop = scheduler.yield.bind(scheduler);
+    const pause = vi
+      .spyOn(scheduler, "yield")
+      .mockImplementationOnce(async () => {
+        await yieldToEventLoop();
+        controller.abort(reason);
+      });
+    try {
+      const result = await service.inspect(
+        { path },
+        { signal: controller.signal },
+      );
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error).toMatchObject({
+        _tag: "AnalysisCancelledError",
+        operation: "inspect_binary_hardening",
+        cause: reason,
+        partialObservation: {
+          kind: "file-snapshot-hash",
+          path,
+          sha256,
+          bytes: bytes.length,
+        },
+      });
+      const retry = await service.inspect(
+        { path },
+        { signal: new AbortController().signal },
+      );
+      if (!retry.ok) throw retry.error;
+      expect(retry.value.normalized_result).toMatchObject({
+        format: "elf",
+        images: [{ status: "parsed" }],
+      });
+      expect((await readFile(path)).equals(bytes)).toBe(true);
+    } finally {
+      pause.mockRestore();
       await service.close();
     }
   });

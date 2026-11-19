@@ -23,6 +23,7 @@ import {
   type ElfPointerOverlay,
 } from "../native/elfPointerRelocations.js";
 import { sha256Hex } from "../../kernel/sha256Hex.js";
+import { zstandardFrameAllowanceCause } from "../compression/zstandardFrameAllowance.js";
 
 const MAXIMUM_STRING_BYTES = 65_535;
 const MAXIMUM_STRING_WORK = 64 * 1024 * 1024;
@@ -102,8 +103,11 @@ export const inspectAndroidJniLibrary = async (
         kind: "unsupported",
         message: "JNI library inspection requires an ELF image",
       });
-    const directory = readElfDirectoryFromBuffer(bytes);
-    const image = readElfImage(bytes);
+    const directory = readElfDirectoryFromBuffer(
+      bytes,
+      "inspect_android_jni_bindings",
+    );
+    const image = readElfImage(bytes, "inspect_android_jni_bindings");
     const mappings = createFileMappingIndex(image.mappings, image.zero_fills);
     if (image.executable_mappings === undefined)
       return err({
@@ -499,6 +503,9 @@ export const inspectAndroidJniLibrary = async (
         kind: "cancelled",
         message: "JNI library inspection was cancelled",
       });
+    const frameAllowance = zstandardFrameAllowanceCause(cause);
+    if (frameAllowance !== undefined)
+      return err({ kind: "capacity", message: frameAllowance.message });
     if (
       cause instanceof BinaryResourceFailure ||
       (cause instanceof ElfPointerRelocationFailure && cause.kind === "limit")
