@@ -1,0 +1,190 @@
+import { BinaryReader } from "../domain/binaryContainer.js";
+import { Buffer } from "node:buffer";
+import { absoluteOffset, alignUp, type ScanRegion } from "./UefiBytes.js";
+import { formatGuidLittleEndian } from "./UefiGuid.js";
+import {
+  COMPRESSION_GUID_BY_DISPLAY,
+  SECTION_LAYOUT,
+} from "./UefiCodeTables.js";
+
+/** Raw section observation before nesting resolution. */
+export interface SectionDraft {
+  readonly absoluteBase: number;
+  readonly localBase: number;
+  readonly headerLength: number;
+  readonly declaredLength: number;
+  /** Bytes actually covered inside the region (clamped on truncation). */
+  readonly observedLength: number;
+  readonly truncated: boolean;
+  readonly malformed?: boolean;
+  readonly encapsulatesSections?: boolean;
+  readonly typeCode: number;
+  readonly typeName: string;
+  readonly compression:
+    | { readonly kind: "none" }
+    | {
+        readonly kind:
+          | "lzma-custom"
+          | "lzmaf86"
+          | "ami-zlib"
+          | "tiano"
+          | "unknown-compression"
+          | "efi-standard"
+          | "crc32-guided"
+          | "unknown-guid";
+        readonly guid: string | null;
+        readonly dataOffset: number;
+        readonly attributes: number | null;
+      };
+  /** Payload window in this region's buffer, or null for outer frames. */
+  readonly payload: { readonly start: number; readonly end: number } | null;
+}
+
+/** Read one PI section chain, with each child aligned relative to its stream. */
+export function walkSections(
+  region: ScanRegion,
+  localStart: number,
+  localEnd: number,
+  typeNameFor: (typeCode: number) => string,
+  reserve: () => boolean = () => true,
+): { sections: SectionDraft[]; terminated: boolean } {
+  const reader = new BinaryReader(region.buffer, true, "FFS sections");
+  const sections: SectionDraft[] = [];
+  let cursor = localStart;
+  while (cursor + SECTION_LAYOUT.commonLength <= localEnd && reserve()) {
+    const compactSize = reader.u16(cursor) | (reader.u8(cursor + 2) << 16);
+    const typeCode = reader.u8(cursor + SECTION_LAYOUT.typeOffset);
+    const extended = compactSize === SECTION_LAYOUT.largeSectionMarker;
+    const commonLength = extended
+      ? SECTION_LAYOUT.extendedLength
+      : SECTION_LAYOUT.commonLength;
+    if (cursor + commonLength > localEnd) break;
+    const declaredLength = extended
+      ? reader.u32(cursor + SECTION_LAYOUT.extendedSizeOffset)
+      : compactSize;
+    // Even an undersized declaration has a common header we already observed.
+    const observedLength = Math.max(
+      commonLength,
+      Math.min(declaredLength, localEnd - cursor),
+    );
+    const truncated = observedLength < declaredLength;
+    let headerLength: number = commonLength;
+    let compression: SectionDraft["compression"] = { kind: "none" };
+    let encapsulatesSections = typeCode === 0x03;
+    let malformed = declaredLength < commonLength;
+    const fields = cursor + commonLength;
+
+    if (typeCode === 0x01) {
+      headerLength += SECTION_LAYOUT.compressionFieldsLength;
+      malformed = observedLength < headerLength;
+      if (!malformed) {
+        const compressionType = reader.u8(
+          fields + SECTION_LAYOUT.compressionTypeFieldOffset,
+        );
+        if (compressionType === 0) {
+          encapsulatesSections = true;
+          malformed = reader.u32(fields) !== declaredLength - headerLength;
+        } else {
+          compression = {
+            kind:
+              compressionType === 1 ? "efi-standard" : "unknown-compression",
+            guid: null,
+            dataOffset: headerLength,
+            attributes: null,
+          };
+        }
+      }
+    } else if (typeCode === 0x02) {
+      headerLength += SECTION_LAYOUT.guidedFieldsLength;
+      malformed = observedLength < headerLength;
+      if (!malformed) {
+        const dataOffset = reader.u16(
+          fields + SECTION_LAYOUT.guidDataOffsetFieldOffset,
+        );
+        malformed = dataOffset < headerLength || dataOffset > observedLength;
+        if (!malformed) {
+          const guid = formatGuidLittleEndian(region.buffer, fields);
+          headerLength = dataOffset;
+          compression = {
+            kind:
+              guid === null
+                ? "unknown-guid"
+                : (COMPRESSION_GUID_BY_DISPLAY[guid] ?? "unknown-guid"),
+            guid,
+            dataOffset,
+            attributes: reader.u16(
+              fields + SECTION_LAYOUT.guidAttributesFieldOffset,
+            ),
+          };
+        }
+      }
+    }
+
+    sections.push({
+      absoluteBase: absoluteOffset(region, cursor),
+      localBase: cursor,
+      headerLength,
+      declaredLength,
+      observedLength,
+      truncated,
+      ...(malformed ? { malformed: true } : {}),
+      ...(encapsulatesSections ? { encapsulatesSections: true } : {}),
+      typeCode,
+      typeName: typeNameFor(typeCode),
+      compression,
+      payload: malformed
+        ? null
+        : { start: cursor + headerLength, end: cursor + observedLength },
+    });
+    if (declaredLength < commonLength || truncated) {
+      return { sections, terminated: false };
+    }
+    cursor = localStart + alignUp(cursor + declaredLength - localStart, 4);
+  }
+  return { sections, terminated: cursor >= localEnd };
+}
+
+/** Payload window of one section as a sub-region; null when empty. */
+export function sectionPayloadRegion(
+  region: ScanRegion,
+  section: SectionDraft,
+): ScanRegion | null {
+  if (section.payload == null) {
+    return null;
+  }
+  const start = Math.min(section.payload.start, region.end);
+  const end = Math.min(section.payload.end, region.end);
+  if (start >= end) {
+    return null;
+  }
+  return {
+    buffer: region.buffer,
+    start,
+    end,
+    origin: absoluteOffset(region, start),
+    ...(region.sourceStream === undefined
+      ? {}
+      : { sourceStream: region.sourceStream }),
+  };
+}
+
+/**
+ * EFI_AMD_ZLIB_SECTION_HEADER (UEFITool ffs.h): a 0x100-byte header —
+ * 0x14 zero bytes, CompressedSize u32 LE, 0xE8 zero footer — sits between the
+ * GUID-defined header and the zlib-wrapped stream at payload offset 0x100.
+ */
+export const AMD_ZLIB_HEADER_LENGTH = 0x100;
+
+/** Peel the 0x100-byte AMD header off one ami-zlib payload, or null when short. */
+export function peelAmiZlibPayload(
+  payload: Buffer,
+): { stream: Buffer; declaredCompressedSize: number } | null {
+  if (payload.length < AMD_ZLIB_HEADER_LENGTH) {
+    return null;
+  }
+  const payloadReader = new BinaryReader(payload, true, "AMD zlib section");
+  return {
+    stream: payload.subarray(AMD_ZLIB_HEADER_LENGTH),
+    declaredCompressedSize: payloadReader.u32(0x14),
+  };
+}
