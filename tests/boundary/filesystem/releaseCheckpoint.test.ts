@@ -447,6 +447,44 @@ it.each([
   },
 );
 
+it.each([
+  { spacing: "adjacent", separator: "\n", includeRestart: true },
+  { spacing: "separated", separator: "\n\n", includeRestart: true },
+  { spacing: "separated", separator: "\n\n", includeRestart: false },
+])(
+  "validates $spacing list migration with restart step $includeRestart",
+  async ({ separator, includeRestart }) => {
+    const steps =
+      "- Set `--new-path` to an absolute path.\n- Restart the client.";
+    const f = await fixture(
+      "fix(contracts)!: change path inputs",
+      "BREAKING CHANGE: Migrate configuration:" +
+        separator +
+        steps +
+        "\n\nReviewed-by: Fixture Reviewer",
+    );
+    const notes = includeRestart ? steps : steps.split("\n")[0];
+    await candidate(
+      f,
+      "6.0.0",
+      "### ⚠ BREAKING CHANGES\n\nMigrate configuration:\n\n" + notes,
+    );
+    const result = verify(f);
+    if (includeRestart) {
+      await expect(result).resolves.toMatchObject({
+        stdout: expect.stringContaining('"expectedVersion": "6.0.0"'),
+      });
+    } else {
+      await expect(result).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining(
+          "migration notes omit unreleased breaking changes",
+        ),
+      });
+    }
+  },
+);
+
 it("rejects a minor when a GitHub merge commit carries its bang marker in the PR title", async () => {
   const f = await fixture("fix(contracts)!: require absolute paths", "", {
     mergePullRequest: true,
@@ -520,13 +558,19 @@ it("allows release examples with a release heading before genuine migration note
   await expect(verify(f)).resolves.toMatchObject({ stderr: "" });
 });
 
-it("requires genuine migration notes outside a fenced Markdown example", async () => {
+it.each([
+  {
+    form: "a fenced example",
+    notes:
+      "### Features\n\n~~~markdown\n### ⚠ BREAKING CHANGES\n\nSee #948.\n~~~",
+  },
+  {
+    form: "a wrapped inline code example",
+    notes: "### ⚠ BREAKING CHANGES\n\n- Syntax: `See #948\n  for details.`",
+  },
+])("requires genuine migration notes outside $form", async ({ notes }) => {
   const f = await fixture();
-  await candidate(
-    f,
-    "6.0.0",
-    "### Features\n\n~~~markdown\n### ⚠ BREAKING CHANGES\n\nSee #948.\n~~~",
-  );
+  await candidate(f, "6.0.0", notes);
   await expect(verify(f)).rejects.toMatchObject({
     code: 1,
     stderr: expect.stringContaining(
@@ -534,6 +578,54 @@ it("requires genuine migration notes outside a fenced Markdown example", async (
     ),
   });
 });
+
+it.each([
+  {
+    form: "the entire footer quoted as wrapped code",
+    footer: "Use absolute MCP paths. Relative paths are rejected.",
+    notes: "Example: `Use absolute MCP paths.\n  Relative paths are rejected.`",
+    accepted: false,
+  },
+  {
+    form: "a migration instruction with the exact inline options",
+    footer: "Replace `--old-path` with `--mcp-path`.",
+    notes: "**Replace** `--old-path` with\n  `--mcp-path`.",
+    accepted: true,
+  },
+  {
+    form: "the same instruction with a different inline option",
+    footer: "Replace `--old-path` with `--mcp-path`.",
+    notes: "**Replace** `--old-path` with\n  `--mcp-paths`.",
+    accepted: false,
+  },
+  {
+    form: "a different value inside an inline command",
+    footer:
+      'Run `rea capture --name "two  spaces"` before collecting Evidence.',
+    notes: 'Run `rea capture --name "two spaces"` before collecting Evidence.',
+    accepted: false,
+  },
+])(
+  "validates migration wording from $form",
+  async ({ footer, notes, accepted }) => {
+    const f = await fixture(
+      "fix(contracts)!: change path inputs",
+      `BREAKING CHANGE: ${footer}`,
+    );
+    await candidate(f, "6.0.0", `### ⚠ BREAKING CHANGES\n\n- ${notes}`);
+    const result = verify(f);
+    if (accepted) {
+      await expect(result).resolves.toHaveProperty("stdout");
+    } else {
+      await expect(result).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining(
+          "migration notes omit unreleased breaking changes",
+        ),
+      });
+    }
+  },
+);
 
 it("recognizes a BREAKING CHANGE footer without a bang in the subject", async () => {
   const f = await fixture(
