@@ -30,6 +30,7 @@ for new work, roadmap granularity and producer-owned contracts.
 - [ELF separate debug-file linkage](native/elf-debug-link/spec.md) ([plan](native/elf-debug-link/plan.md), [tasks](native/elf-debug-link/tasks.md))
 - [Go static string-header literal recovery](native/go-string-literals/spec.md) ([plan](native/go-string-literals/plan.md), [tasks](native/go-string-literals/tasks.md))
 - [Windows Shell Link shortcut inspection](native/windows-shortcut/spec.md) ([plan](native/windows-shortcut/plan.md), [tasks](native/windows-shortcut/tasks.md))
+- [Compound File Binary container inspection](native/compound-file/spec.md) ([plan](native/compound-file/plan.md), [tasks](native/compound-file/tasks.md))
 - [NTFS $MFT and USN Journal inspection](native/ntfs-mft/spec.md) ([plan](native/ntfs-mft/plan.md), [tasks](native/ntfs-mft/tasks.md))
 - [Solidity terminal metadata inspection](solidity/cbor-metadata/spec.md) ([plan](solidity/cbor-metadata/plan.md), [tasks](solidity/cbor-metadata/tasks.md), [verification](solidity/cbor-metadata/verification.md))
 - [Inspect a V8 code cache container](v8/code-cache-inspection/spec.md) ([plan](v8/code-cache-inspection/plan.md), [tasks](v8/code-cache-inspection/tasks.md))
