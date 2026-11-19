@@ -101,3 +101,27 @@ it("resolves a path-qualified command at its own location with PATHEXT, never on
     ),
   ).toEqual({ ok: true, value: "C:\\project\\.venv\\Scripts\\python.EXE" });
 });
+
+it("allows batch launchers without selecting unsupported PATHEXT interpreters", async () => {
+  lookup.stat.mockResolvedValue({ isFile: () => true });
+  expect(
+    await findWindowsExecutable(
+      "codex",
+      { PATH: "C:\\tools", PATHEXT: ".PS1;.JS;.CMD;.EXE" },
+      { ...options(), allowBatch: true },
+    ),
+  ).toEqual({ ok: true, value: "C:\\tools\\codex.CMD" });
+  expect(lookup.stat).toHaveBeenCalledExactlyOnceWith("C:\\tools\\codex.CMD");
+});
+
+it("does not admit an explicitly named script without its interpreter", async () => {
+  lookup.stat.mockResolvedValue({ isFile: () => true });
+  expect(
+    await findWindowsExecutable(
+      "codex.ps1",
+      { PATH: "C:\\tools", PATHEXT: ".PS1;.CMD" },
+      { ...options(), allowBatch: true },
+    ),
+  ).toEqual({ ok: false, error: { kind: "missing" } });
+  expect(lookup.stat).not.toHaveBeenCalled();
+});
