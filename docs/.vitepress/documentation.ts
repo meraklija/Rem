@@ -499,6 +499,11 @@ export const documentationSections = [
         route: "/wxapkg",
       },
       {
+        text: "Windows Prefetch files",
+        source: "windows-prefetch.md",
+        route: "/windows-prefetch",
+      },
+      {
         text: "Binary hardening",
         source: "binary-hardening.md",
         route: "/binary-hardening",
