@@ -4,6 +4,9 @@ import {
   V8_CODE_CACHE_LEGACY_MODULE_BIT,
   V8_CODE_CACHE_MODULE_BIT,
   V8_CODE_CACHE_HEADER_BYTES,
+  V8_CODE_CACHE_HEADER_SIZES,
+  V8_CODE_CACHE_MIN_HEADER_BYTES,
+  V8_CODE_CACHE_NARROW_HEADER_BYTES,
   V8_CODE_CACHE_MAGIC_HIGH,
   V8_CODE_CACHE_SOURCE_LENGTH_MASK,
   type V8CodeCache,
@@ -72,9 +75,9 @@ export const parseV8CodeCache = (
 ): V8CodeCache => {
   if (bytes.length !== artifact.bytes)
     malformed("Selected artifact length disagrees with the retained bytes.");
-  if (bytes.length < V8_CODE_CACHE_HEADER_BYTES)
+  if (bytes.length < V8_CODE_CACHE_MIN_HEADER_BYTES)
     malformed(
-      `Selected file is shorter than the ${String(V8_CODE_CACHE_HEADER_BYTES)}-byte V8 code cache header.`,
+      `Selected file is shorter than the ${String(V8_CODE_CACHE_MIN_HEADER_BYTES)}-byte V8 code cache header.`,
     );
 
   const field = (index: number): number => bytes.readUInt32LE(index * 4);
@@ -85,12 +88,34 @@ export const parseV8CodeCache = (
       `Container magic 0x${magic.toString(16).padStart(8, "0")} does not carry the V8 code cache high half 0x${V8_CODE_CACHE_MAGIC_HIGH.toString(16)}; this file is not a V8 code cache.`,
     );
 
+  // The payload-length word sits at byte 20 for every producer, because V8 pads the header
+  // after its words instead of inside them. The declared length therefore states how much
+  // trailing alignment padding the container carries, and the header size follows from it.
   const declaredPayload = field(5);
-  const payloadOffset = V8_CODE_CACHE_HEADER_BYTES;
-  const expectedPayload = bytes.length - payloadOffset;
-  if (declaredPayload !== expectedPayload)
+  const payloadOffset = bytes.length - declaredPayload;
+  // A 64-bit producer pads the header with a word V8 leaves zero, so a four-byte-short wide
+  // container derives the same 28-byte size a 32-bit producer writes. The producer zeroes that
+  // padding rather than copying payload over it: `SerializedData::AllocateWithPayload`
+  // (src/snapshot/snapshot-data.cc) does `std::fill_n(data_, header_size, 0)` before writing the
+  // header words, and `kHeaderSize = POINTER_SIZE_ALIGN(kUnalignedHeaderSize)`
+  // (src/snapshot/code-serializer.h) puts the four padding bytes inside `header_size`. So a zero
+  // word at byte 28 says the container claims a wide header whose payload does not begin there.
+  // The rule is stated as the reservation it is rather than as proof: a narrow container whose
+  // payload happened to begin with four zero bytes would also match, and no reading of the header
+  // alone can separate the two.
+  if (
+    payloadOffset === V8_CODE_CACHE_NARROW_HEADER_BYTES &&
+    bytes.length >= V8_CODE_CACHE_HEADER_BYTES &&
+    field(V8_CODE_CACHE_NARROW_HEADER_BYTES / 4) === 0
+  )
     malformed(
-      `Header declares a ${String(declaredPayload)}-byte payload but ${String(expectedPayload)} bytes follow the ${String(V8_CODE_CACHE_HEADER_BYTES)}-byte header; the container is truncated or corrupt.`,
+      `Header declares a ${String(declaredPayload)}-byte payload, which resolves to the ${String(V8_CODE_CACHE_NARROW_HEADER_BYTES)}-byte header size only if the ${String(V8_CODE_CACHE_HEADER_BYTES - V8_CODE_CACHE_NARROW_HEADER_BYTES)} alignment bytes a wide header zeroes are payload; the container is either ${String(V8_CODE_CACHE_HEADER_BYTES - V8_CODE_CACHE_NARROW_HEADER_BYTES)} bytes short of the wide layout or a narrow one whose payload begins with a zero word, and this reader cannot tell them apart.`,
+    );
+  if (
+    !(V8_CODE_CACHE_HEADER_SIZES as readonly number[]).includes(payloadOffset)
+  )
+    malformed(
+      `Header declares a ${String(declaredPayload)}-byte payload, leaving ${String(payloadOffset)} header bytes, which is no admitted V8 code cache header size (${V8_CODE_CACHE_HEADER_SIZES.join(" or ")}); the container is truncated or corrupt.`,
     );
 
   const sourceWord = field(2);
@@ -162,13 +187,15 @@ export const parseV8CodeCache = (
     header: {
       magic,
       magic_build_stable: magicHigh,
-      fields: HEADER_ROLES.map((entry, index) => ({
+      // A 32-bit producer omits the trailing alignment padding, so only the words this
+      // container actually carries are reported.
+      fields: HEADER_ROLES.slice(0, payloadOffset / 4).map((entry, index) => ({
         offset: index * 4,
         value: field(index),
         role: entry.role,
         status: entry.status,
       })),
-      header_bytes: V8_CODE_CACHE_HEADER_BYTES,
+      header_bytes: payloadOffset,
       source_length: sourceLength,
       producer,
     },
